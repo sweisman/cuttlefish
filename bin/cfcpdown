@@ -1,0 +1,11 @@
+#!/usr/bin/perl
+use strict;
+use cmf::cf ();
+
+my $code = shift;
+my $file = shift;
+
+exit unless cmf::cf::check($code);
+# xxx should check here whether file exists on remote server
+print cmf::cf::cmd_file($code, $file);
+exit;

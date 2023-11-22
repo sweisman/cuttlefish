@@ -1,0 +1,6 @@
+#!/bin/sh
+set -x
+PIPE="$1"
+CMD="C:\\Windows\\system32\\cmd.exe /k cd"
+PORT=`cfpipe "$PIPE" "EXEC 0 $CMD" | awk '{print $3}' `
+nc localhost $PORT

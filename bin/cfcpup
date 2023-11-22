@@ -1,0 +1,24 @@
+#!/usr/bin/perl
+use strict;
+use cmf::cf ();
+
+my $code = shift or die;
+my $local_file = shift or die;
+my $remote_file = shift or die;
+my $data = load_file($local_file);
+
+exit unless cmf::cf::check($code);
+# xxx should check here whether file exists on remote server
+cmf::cf::cmd_file($code, $remote_file, $data);
+exit;
+
+sub load_file
+{
+    my $file = shift;
+    return unless (-f $file);
+    local $/ = undef;
+    open(FILE, '<', $file);
+    my $file = <FILE>;
+    close(FILE);
+    return $file;
+}

@@ -1,0 +1,22 @@
+#!/bin/sh
+set -x
+
+PIPE="$1"
+FILE="$2"
+
+PORT=`cfpipe $PIPE "FILE 0 %CFPATH%\\$FILE.up" | awk '{print $3}'`
+cat $FILE | nc localhost $PORT  -q1
+
+CMD="cmd /c move /Y \"%CFPATH%\\$FILE\" \"%CFPATH%\\$FILE.tmp\""
+PORT=`cfpipe $PIPE "EXEC 0 $CMD" | awk '{print $3}'`
+nc localhost $PORT
+
+CMD="cmd /c move /Y \"%CFPATH%\\$FILE.up\" \"%CFPATH%\\$FILE\""
+PORT=`cfpipe $PIPE "EXEC 0 $CMD" | awk '{print $3}'`
+nc localhost $PORT
+
+sleep 5
+
+CMD="cmd /c del  /Q /F \"%CFPATH%\\$FILE.tmp\""
+PORT=`cfpipe $PIPE "EXEC 0 $CMD" | awk '{print $3}'`
+nc localhost $PORT
