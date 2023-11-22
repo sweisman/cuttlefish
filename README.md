@@ -14,7 +14,7 @@ Cuttlefish lacks the broad feature set of other RATs, but it is the most extensi
 
 The client runs on Windows, and is statically compiled with OpenSSL or WolfSSL (or another similar library). It is written using vanilla ANSI C and the stock Windows 32 API with no extensions.
 It uses a flexible multithreaded design to handle command execution and file transfers.
-Further, it depends on no DLLs.
+Further, it depends on no runtime DLLs.
 
 It is typically invoked and managed with a Service Manager like [NSSM](https://nssm.cc/).
 
@@ -44,26 +44,20 @@ The server and client support multiple bidirectional operations in flight simult
 To create a server certificate, follow the steps in the [Stunnel HOWTO](https://www.stunnel.org/howto.html),
 section *Generating the stunnel certificate and private key (pem)*.
 
-### Client certificate
-
-```
-cd /etc/stunnel
-mkdir clients # if doesn't exist
-```
-
-File used to create a new client certificate:
+### Client Certificate
 
 The parameter `commonName` is used by convention to store the unique id to control and interact with a specific client.
-Where `commonName`, by convention, is the code used to control the client, send commands and data to it, and receive data in return. It is the unique ID by which the connecting client is identified.
+Where `commonName`, by convention, is the code used to interact with the server, send commands to it, and receive a response in return. It is the unique ID by which the connecting client is identified.
 
 Create a new directory:
 
 ```
-mkdir /etc/stunnel/clients/$commonName
+cd /etc/stunnel
+mkdir clients # if doesn't exist
+mkdir clients/$commonName # $commonNameDir
 ```
 
 In `$commonNameDir` (/etc/stunnel/clients/$commonName), save the following as cert.conf.
-
 
 ```
 [req]
@@ -130,23 +124,23 @@ execargs = /opt/myApp/bin/cf-server -p /opt/myApp/pipes/
 
 Each connection from a client creates a Unix Domain Socket in the `-p` directory, where `commonName` is used as the file name.
 
-It accepts the following commands to initiate activity on the client:
+It accepts the following plain text commands to initiate activity on the client:
 ```
 CONNECT _LOCAL_PORT_ _REMOTE_DOMAIN_ _REMOTE_PORT_
-eg CONNECT 3389 localhost 3389 # RDP Remote Desktop access
+eg "CONNECT 3389 localhost 3389" # RDP Remote Desktop access
 
 EXEC _LOCAL_PORT_ _REMOTE_COMMAND_TO_EXECUTE_
-EXEC 0 cmd /C dir /l /b /ad "C:\Program Files\"
+eg 'EXEC 0 cmd /C dir /l /b /ad "C:\Program Files\"'
 
 FILE _LOCAL_PORT_ _SOURCE_OR_DEST_TO_TRANSFER_
-FILE 0 c:\tmp.txt # if file c:\tmp.txt exists, transfer to server, else transfer to client and create it
+eg "FILE 0 c:\tmp.txt" # if file c:\tmp.txt exists, transfer to server, else transfer to client and create it
 ```
 
 For the above commands, the `0` means to randomly pick a local port to use for sending and receiving data. Alternatively, specify a port.
-The server opens a socket for listening that the invoker is responsible to open and interact with.
 The response to the command includes the local port on the server opened for listening to interact with the client and send/receive data.
+The server opens a TCP socket for listening that the invoker is responsible to connect to and interact with.
 
-The `CONNECT` and `EXEC` support bidirectional data transfer if the remote command or forwarded network connection supports such.
+The `CONNECT` and `EXEC` operations support bidirectional data transfer if the remote command or forwarded network connection supports such.
 
 For `EXEC` the socket sends/receives STDIN/STDOUT to/from the running executable on the client.
 
