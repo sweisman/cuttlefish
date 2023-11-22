@@ -189,6 +189,7 @@ Download a file.
 
 Needs OpenSSL or WolfSSL (formerly CyaSSL); to cross-compile OpenSSL for Windows:
 
+```
 ./Configure --cross-compile-prefix=i686-w64-mingw32- -DOPENSSL_NO_CAPIENG mingw no-shared
 ./Configure --cross-compile-prefix=x86_64-w64-mingw32- mingw64
 make
@@ -198,24 +199,32 @@ make distclean
 ./configure --host=i686-w64-mingw32 --enable-static --enable-opensslExtra LDFLAGS="-lws2_32" CC=i686-w64-mingw32-gcc AR=i686-w64-mingw32-ar ac_cv_func_malloc_0_nonnull=yes ac_cv_func_realloc_0_nonnull=yes
 make
 i686-w64-mingw32-strip -g lib*.a
+```
 
 libcrypto.a and libssl.a are static; libeay32.a and libssl32.a are dynamic
 
 #### Building the Client
 
 Cross-compile on Linux:
+```
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /opt/cmf/src/cf/include cf-client-win.c XGetopt.c -o Cuttlefish.exe -L /opt/cmf/src/cf/lib -lssl -lcrypto -lcrypt32 -lws2_32 -lgdi32 -Wl,--subsystem,console
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static                            cf-client-win.c XGetopt.c -o Cuttlefish.exe -lssl -lcrypto -lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32 -static-libgcc -shared -Wl,--subsystem,console
+```
 
 ##### With CYASSL (similar for WolfSSL)
+```
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /opt/cmf/src/cf/include cf-client-win.c -o Cuttlefish.exe -L /opt/cmf/src/cf/lib -lssl -lcrypto -lws2_32 -lntdll -lgdi32 -Wl,-verbose,--subsystem,native,-e,_NtProcessStartup@4
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /opt/cmf/src/cf/include -I ./cyassl-2.0.8 -DCF_CYASSL cf-client-win.c XGetopt.c -o Cuttlefish.exe -L /opt/cmf/src/cf/cyassl-2.0.8/src/.libs -lcyassl -lws2_32 -lgdi32 -Wl,-verbose,--subsystem,console
+```
 
 Compile on Windows:
+```
 gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I C:\openssl-1.1.1g-win32-mingw\include cf-client-win.c XGetopt.c -o Cuttlefish.exe -L C:\openssl-1.1.1g-win32-mingw\lib -lssl -lcrypto -lcrypt32 -lws2_32 -lgdi32 -static-libgcc -shared -Wl,--subsystem,console
 gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /c/openssl-1.1.1g-win32-mingw/include cf-client-win.c XGetopt.c -o Cuttlefish.exe -L /c/openssl-1.1.1g-win32-mingw/lib -lssl -lcrypto -lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32 -Wl,--subsystem,console
+```
 
 ### Building the Server
-
+```
 gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os cf-server.c -o cf-server
 gcc -static -m32 -Wall -Wextra -pedantic -std=gnu99 -Werror -Os cf-server.c -o cf-server32
+```
