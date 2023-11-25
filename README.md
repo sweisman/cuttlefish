@@ -3,25 +3,30 @@ Reverse Tunnel and Remote Access Toolkit
 
 This code was in legitimate production use for many years.
 
-### Cuttlefish is a RAT that provides three operations:
+### Cuttlefish is a RAT that provides three primitives:
 
 1. Upload and download files.
-2. Execute a command passively or actively, by redirecting STDIN and STDOUT.
+2. Execute a command passively or actively, by interacting with STDIN and STDOUT (STDERR is not supported with the current design).
 3. Forward network connections to a selected host and port.
 
 All other features RATs boast supporting, whether legitimate or nefarious, can be implemented via these three fundamental operations.
 Cuttlefish lacks the broad feature set of other RATs, but it is the most extensible and powerful RAT available, along with the most compact.
+The code is cleanly written and easy to comprehend and extend.
 
-The client runs on Windows, and is statically compiled with OpenSSL or WolfSSL (or another similar library). It is written using vanilla ANSI C and the stock Windows 32 API with no extensions.
-It uses a flexible multithreaded design to handle command execution and file transfers.
+The client runs on Windows.
+It is written using vanilla ANSI C and the stock Windows 32 API, and statically linked to OpenSSL or WolfSSL (or another similar library), and nothing else.
 Further, it depends on no runtime DLLs.
+
+It uses a flexible multithreaded design to handle command execution and file transfers.
 
 It is typically invoked and managed with a Service Manager like [NSSM](https://nssm.cc/).
 
-The server is likewise written in ANSI C intended to run in a Linux or Unix environment. It is designed to be spawned by `stunnel`, which establishes and maintains the connection.
-Each client connection has its own server to accept and process commands.
+The server is likewise written in ANSI C intended to run in a Linux or Unix environment. It is designed to be spawned by `stunnel` (or similar), which establishes and maintains the connection,
+and sends/receives network data to the server process via STDIO.
+Each client connection has its own server process to accept and process commands.
+A single server can easily support many thousands of active client connections.
 
-The server and client support multiple bidirectional operations in flight simultaneously.
+The communications protocol supports multiple active bidirectional primitives in flight simultaneously.
 
 ### Server Parameters
 ```
@@ -140,7 +145,7 @@ For the above commands, the `0` means to randomly pick a local port to use for s
 The response to the command includes the local port on the server opened for listening to interact with the client and send/receive data.
 The server opens a TCP socket for listening that the invoker is responsible to connect to and interact with.
 
-The `CONNECT` and `EXEC` operations support bidirectional data transfer if the remote command or forwarded network connection supports such.
+The `CONNECT` and `EXEC` primitives support bidirectional data transfer if the remote command or forwarded network connection supports such.
 
 For `EXEC` the socket sends/receives STDIN/STDOUT to/from the running executable on the client.
 
@@ -153,10 +158,10 @@ For `FILE` the behavior is the following:
 3. Otherwise, it creates the file and data transmitted from the server to the client is added to the file ("upload"), via a socket on the port like the above item.
 4. The invoker is expected to know and code for this remote client behavior.
 
-These commands are also available:
+These administrative server commands are also available:
 
 ```
-STATUS - list of all open connections for CONNECT/EXEC/FILE operations
+STATUS - list of all open connections for CONNECT/EXEC/FILE primitives
 CLOSE - controlled shutdown of connection, including all open connections
 ```
 
@@ -167,10 +172,12 @@ See examples of command invocation, parsing the command response, and interactin
 `cfpipe` is a BASH script that simplifies using `cuttlefish` from the command line. It depends on `socat`, which is available in most distros.
 
 Remotely execute a command. STDOUT is returned.
-`cfcmd /opt/myApp/pipes/$commonName "net start"`
-`cfcmd /opt/myApp/pipes/$commonName 'cmd /C dir /-C'`
+```
+cfcmd /opt/myApp/pipes/$commonName "net start"
+cfcmd /opt/myApp/pipes/$commonName 'cmd /C dir /-C'
+```
 
-Remotely execute a command shell (or another program) and run it interactively through STDIO.
+Remotely execute a command shell (or another program) and run it interactively through the console.
 `cfcmdshell /opt/myApp/pipes/$commonName`
 
 Upload a file.
@@ -195,7 +202,7 @@ make
 i686-w64-mingw32-strip -g lib*.a
 ```
 
-libcrypto.a and libssl.a are static; libeay32.a and libssl32.a are dynamic
+Library files libcrypto.a and libssl.a are static; libeay32.a and libssl32.a are dynamic
 
 #### Building the Client
 
