@@ -13,6 +13,13 @@ All other features RATs boast supporting, whether legitimate or nefarious, can b
 Cuttlefish lacks the broad feature set of other RATs, but it is the most extensible and powerful RAT available, along with the most compact.
 The code is cleanly written and easy to comprehend and extend.
 
+A reverse-tunnel archtecture is used, whereby the Windows client connects to the Linux server, and then the server initiates commands acted on by the client.
+The protocol is bespoke for this use and is simple and robust and flexible in design, allowing many commands to be in flight simultaneously.
+
+Each connection is highly secure, being double-certified (server and client each have certificates).
+The Linux server uses Stunnel to manage the socket connections and invoke a listener program that communicates with the client.
+The Windows client is a single `.EXE` statically-linked with an SSL library.
+
 The client runs on Windows.
 It is written using vanilla ANSI C and the stock Windows 32 API, and statically linked to OpenSSL or WolfSSL (or another similar library), and nothing else.
 Further, it depends on no runtime DLLs.
@@ -25,8 +32,6 @@ The server is likewise written in ANSI C intended to run in a Linux or Unix envi
 and sends/receives network data to the server process via STDIO.
 Each client connection has its own server process to accept and process commands.
 A single server can easily support many thousands of active client connections.
-
-The communications protocol supports multiple active bidirectional primitives in flight simultaneously.
 
 ### Server Parameters
 ```
