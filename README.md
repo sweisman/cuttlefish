@@ -147,7 +147,7 @@ The server opens a TCP socket for listening that the invoker is responsible to c
 
 The `CONNECT` and `EXEC` primitives support bidirectional data transfer if the remote command or forwarded network connection supports such.
 
-For `EXEC` the socket sends/receives STDIN/STDOUT to/from the running executable on the client.
+For `EXEC` the socket sends/receives STDIN/STDOUT to/from the running executable on the client. STDERR is not supported by the protocol as implemented.
 
 For `CONNECT` the socket sends/receives data to/from the final endpoint.
 
