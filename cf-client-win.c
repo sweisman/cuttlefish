@@ -1168,14 +1168,15 @@ int ssl_write(const void *buf, int len)
         int remaining = len;
         int io_loop = 0;
 
+        if (WaitForSingleObject(mutex_ssl_io, INFINITE) != WAIT_OBJECT_0)
+        {
+            print_log("SSL WRITE MUTEX ERROR");
+            return -3;
+        }
+
         for (;;)
         {
             print_log("SSL WRITE START loop=%d, len=%d", io_loop, remaining);
-            if (WaitForSingleObject(mutex_ssl_io, INFINITE) != WAIT_OBJECT_0)
-            {
-                print_log("SSL WRITE MUTEX ERROR");
-                return -3;
-            }
 
             int result = SSL_write(ssl, cur_buf, remaining);
             int error = SSL_get_error(ssl, result);
@@ -1240,8 +1241,6 @@ int ssl_write(const void *buf, int len)
                     break;
             }
 
-            ReleaseMutex(mutex_ssl_io);
-
             if (!io_loop)
                 break;
             else if (io_loop > 10)
@@ -1253,6 +1252,8 @@ int ssl_write(const void *buf, int len)
 
             Sleep(io_loop * 3);
         }
+
+        ReleaseMutex(mutex_ssl_io);
     }
 
     return ssl_io_result;

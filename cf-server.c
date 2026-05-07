@@ -167,9 +167,6 @@ int main(int argc, char *argv[])
         fd_set       fd_list;
 
         SELECT_START(&fd_list, high_fd);
-// xxx add semaphore for exec commands. do not listen for any commands while an exec is in flight
-// xxx either that or when an exec is running, wait for a first response packet before accepting other commands
-// xxx or simply delay any other commands for a fixed length of time
         SELECT_ADD(&fd_list, control_listen, high_fd);
         SELECT_ADD(&fd_list, tunnel_in, high_fd);
         for (uint32_t pos = 0; pos <= cf_socket_idx; pos++)
@@ -191,7 +188,6 @@ int main(int argc, char *argv[])
         }
         else if (!select_count)
         {
-// xxx reduce semaphore count by 1 until 0
         }
         else
         {
@@ -296,7 +292,6 @@ int event_handle(fd_set *p_fd_list)
         {
             case CF_PACKET_DISCONNECT:
                 print_log("event_handle: client-side disconnect");
-// xxx end semaphore if exec socket
                 if ((cf_socket = cf_socket_find(cf_packet->id)))
                     cf_socket_free(cf_socket);
                 else
@@ -322,7 +317,6 @@ int event_handle(fd_set *p_fd_list)
                 }
 
                 print_log("event_handle: client-side data");
-// xxx end semaphore if exec socket
                 if ((cf_socket = cf_socket_find(cf_packet->id)))
                 {
                     if (cf_socket->accept_socket)
