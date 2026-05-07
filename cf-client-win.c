@@ -52,10 +52,10 @@ typedef struct
 
     // FILE
     char                mode;
-    FILE                *fp;
+    HANDLE              hFile;
 } s_cf_socket;
 
-SOCKET server_socket;
+SOCKET server_socket = INVALID_SOCKET;
 HANDLE mutex_ssl_io = NULL, mutex_log = NULL, job_obj = NULL;
 time_t packet_send_time = 0, packet_read_time = 0;
 char cf_path[MAX_BUFFER_SIZE] = "";
@@ -66,9 +66,14 @@ int        ssl_io_result = 1, timeout = 0;
 
 int send_buffer(int socket, const char *buf, int len);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#include "miniz.c"
+#pragma GCC diagnostic pop
 #include "common.h"
 #include "XGetopt.h"
 
+void shutdown_handler(void);
 void event_loop(void);
 int event_handle(void);
 unsigned __stdcall cf_connect(LPVOID arg);
@@ -173,6 +178,7 @@ int main(int argc, char *argv[])
     srand((unsigned int) time(NULL));
     mutex_log = CreateMutex(NULL, FALSE, NULL);
     mutex_ssl_io = CreateMutex(NULL, FALSE, NULL);
+    atexit(shutdown_handler);
 
     print_log("MAIN: ENTER EVENT LOOP");
 
@@ -203,15 +209,6 @@ int main(int argc, char *argv[])
     } while (0);
 
     print_log("MAIN: EXIT EVENT LOOP");
-
-// xxx move shutdown code to atexit() function
-    ssl_end(-10000);
-    if (server_socket != INVALID_SOCKET)
-        close_socket(server_socket);
-    WSACleanup();
-
-    CLOSE_HANDLE(mutex_log);
-    CLOSE_HANDLE(mutex_ssl_io);
 
     print_log("MAIN: EXIT");
 
@@ -306,16 +303,26 @@ int event_handle(void)
     s_cf_packet *cf_packet = queue_get();
     s_cf_socket *cf_socket;
     struct _stat stat_buf;
-    //~ int payload_len;
     char *file_op;
-    //~ char *ext;
-    int file_path_err = 0;
-    int i = 0;
 
     if (!cf_packet)
         return 0;
 
     char *payload = (char *) PACKET_PAYLOAD(cf_packet);
+    int payload_len = cf_packet->len;
+    static unsigned char decomp_buf[MAX_BUFFER_SIZE];
+
+    if (cf_packet->type == CF_PACKET_COMPRESSED_DATA)
+    {
+        mz_ulong dest_len = sizeof(decomp_buf);
+        if (mz_uncompress(decomp_buf, &dest_len, (const unsigned char *) payload, (mz_ulong) payload_len) == MZ_OK)
+        {
+            payload = (char *) decomp_buf;
+            payload_len = (int) dest_len;
+        }
+        else
+            print_log("EVENT HANDLE DECOMPRESS ERROR: id=%d", cf_packet->id);
+    }
 
     print_log("EVENT HANDLE START: id=%d, type=%d, len=%d", cf_packet->id, cf_packet->type, cf_packet->len);
 
@@ -411,48 +418,54 @@ int event_handle(void)
 
                 print_log("    EVENT HANDLE TYPE: FILE payload={%s}", cf_socket->payload);
 
-                // xxx change to use open(), or OpenFile() or whatever API is not buffered, then use ReadFile and WriteFile
-
-                if (file_op[0] == 'r' && (cf_socket->fp = fopen(cf_socket->payload, file_op)))
+                if (file_op[0] == 'r')
                 {
+                    cf_socket->hFile = CreateFile(cf_socket->payload, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (cf_socket->hFile == INVALID_HANDLE_VALUE)
+                    {
+                        print_log("    EVENT HANDLE FILE FATAL ERROR: CreateFile read %d", GetLastError());
+                        cf_socket->hFile = NULL;
+                        disconnect(cf_socket);
+                        break;
+                    }
                     print_log("    EVENT HANDLE TYPE: FILE GET id=%d", cf_socket->id);
-
                     cf_socket->mode = 'r';
                     cf_socket->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
                     if (!(cf_socket->hThread = (HANDLE) _beginthreadex(NULL, 0, cf_file_read, (LPVOID) cf_socket, 0, &cf_socket->thread_id)))
                     {
-                        // assume fatal error always disconnect
                         print_log("    EVENT HANDLE ERROR: _beginthreadex %d", errno);
                         disconnect(cf_socket);
                         break;
                     }
                 }
-                else if (file_op[0] == 'w' && (cf_socket->fp = fopen(cf_socket->payload, file_op)))
-                {
-                    print_log("    EVENT HANDLE TYPE: FILE PUT id=%d", cf_socket->id);
-                    cf_socket->mode = 'w';
-                }
                 else
                 {
-                    // assume fatal error always disconnect
-                    print_log("    EVENT HANDLE FILE FATAL ERROR: fopen %d", errno);
-                    disconnect(cf_socket);
-                    break;
+                    cf_socket->hFile = CreateFile(cf_socket->payload, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (cf_socket->hFile == INVALID_HANDLE_VALUE)
+                    {
+                        print_log("    EVENT HANDLE FILE FATAL ERROR: CreateFile write %d", GetLastError());
+                        cf_socket->hFile = NULL;
+                        disconnect(cf_socket);
+                        break;
+                    }
+                    print_log("    EVENT HANDLE TYPE: FILE PUT id=%d", cf_socket->id);
+                    cf_socket->mode = 'w';
                 }
             }
             else
                 print_log("    EVENT HANDLE ERROR: NO FREE SOCKET id=%d", cf_packet->id);
             break;
 
+        case CF_PACKET_COMPRESSED_DATA:
         case CF_PACKET_DATA:
             if ((cf_socket = cf_socket_find(cf_packet->id)))
             {
-                cf_socket->receive_count += cf_packet->len;
+                cf_socket->receive_count += payload_len;
 
                 if (cf_socket->socket)
                 {
                     print_log("    EVENT HANDLE TYPE: DATA PUT id=%d", cf_socket->id);
-                    if (send_buffer(cf_socket->socket, payload, cf_packet->len))
+                    if (send_buffer(cf_socket->socket, payload, payload_len))
                     {
                         // assume fatal error always disconnect
                         print_log("    EVENT SEND BUFFER ERROR: id=%d", cf_packet->id);
@@ -463,17 +476,18 @@ int event_handle(void)
                 else if (cf_socket->mode == 'w')
                 {
                     // FILE
+                    DWORD bytes_written;
                     print_log("    EVENT HANDLE TYPE: DATA PUT FILE id=%d", cf_socket->id);
-                    fwrite(payload, 1, cf_packet->len, cf_socket->fp);
-// xxx check result
+                    if (!WriteFile(cf_socket->hFile, payload, payload_len, &bytes_written, NULL) || bytes_written != (DWORD) payload_len)
+                        log_socket_error(cf_socket, GetLastError(), "FILE WriteFile partial write");
                 }
                 else if (cf_socket->stdin_write)
                 {
                     // EXEC
                     DWORD result;
                     print_log("    EVENT HANDLE TYPE: DATA PUT EXEC id=%d", cf_socket->id);
-                    WriteFile(cf_socket->stdin_write, payload, cf_packet->len, &result, NULL);
-// xxx check result
+                    if (!WriteFile(cf_socket->stdin_write, payload, payload_len, &result, NULL) || result != (DWORD) payload_len)
+                        log_socket_error(cf_socket, GetLastError(), "EXEC WriteFile partial write");
                 }
                 else
                     print_log("    EVENT HANDLE DATA PUT ERROR: UNKNOWN TYPE id=%d", cf_socket->id);
@@ -570,7 +584,7 @@ unsigned __stdcall cf_connect(LPVOID arg)
                     print_log("CONNECT READ ERROR: ssl_pending id=%d", cf_socket->id);
                     break;
                 }
-                else if (send_packet(cf_socket->id, CF_PACKET_DATA, buffer, result))
+                else if (send_compressed_packet(cf_socket->id, buffer, result))
                 {
                     print_log("CONNECT READ ERROR: READ LOCAL SEND id=%d", cf_socket->id);
                     break;
@@ -665,10 +679,12 @@ unsigned __stdcall cf_exec(LPVOID arg)
         CLOSE_HANDLE(stderr_read);
         CLOSE_HANDLE(stderr_write);
 
-        // xxx check errors on SetNamedPipeHandleState below!
         DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
         if (!SetNamedPipeHandleState(cf_socket->stdout_read, &pipe_mode, NULL, NULL))
+        {
             log_socket_error(cf_socket, GetLastError(), "EXEC SetNamedPipeHandleState");
+            break;
+        }
 
         char buffer[MAX_BUFFER_SIZE];
         DWORD kill = 1;
@@ -703,7 +719,7 @@ unsigned __stdcall cf_exec(LPVOID arg)
                                 print_log("EXEC READ ERROR: ssl_pending id=%d", cf_socket->id);
                                 break;
                             }
-                            else if ((result = send_packet(cf_socket->id, CF_PACKET_DATA, buffer, read_len)))
+                            else if ((result = send_compressed_packet(cf_socket->id, buffer, read_len)))
                             {
                                 print_log("        EXEC ERROR BAD SEND PACKET id=%d", cf_socket->id);
                                 log_socket_error(cf_socket, GetLastError(), "EXEC READ");
@@ -800,7 +816,7 @@ unsigned __stdcall cf_file_read(LPVOID arg)
 {
     s_cf_socket *cf_socket = (s_cf_socket *) arg;
     char buffer[MAX_BUFFER_SIZE];
-    int read_len = 0;
+    DWORD read_len = 0;
 
     print_log("FILE ENTER id=%d, payload={%s}", cf_socket->id, cf_socket->payload);
 
@@ -815,7 +831,7 @@ unsigned __stdcall cf_file_read(LPVOID arg)
             print_log("    FILE READ EXIT: TERMINATE SIGNAL RECEIVED id=%d", cf_socket->id);
             break;
         }
-        else if (!(read_len = fread(buffer, 1, MAX_BUFFER_SIZE, cf_socket->fp)))
+        else if (!ReadFile(cf_socket->hFile, buffer, MAX_BUFFER_SIZE, &read_len, NULL) || !read_len)
         {
             print_log("    FILE READ: EOF id=%d", cf_socket->id);
             break;
@@ -825,7 +841,7 @@ unsigned __stdcall cf_file_read(LPVOID arg)
             print_log("FILE READ ERROR: ssl_pending id=%d", cf_socket->id);
             break;
         }
-        else if (send_packet(cf_socket->id, CF_PACKET_DATA, buffer, read_len))
+        else if (send_compressed_packet(cf_socket->id, buffer, (int) read_len))
         {
             print_log("        FILE READ ERROR BAD SEND PACKET id=%d", cf_socket->id);
             break;
@@ -900,6 +916,16 @@ void disconnect(s_cf_socket *cf_socket)
     }
 
     cf_socket_free(cf_socket);
+}
+
+void shutdown_handler(void)
+{
+    ssl_end(0);
+    if (server_socket != INVALID_SOCKET)
+        close_socket(server_socket);
+    WSACleanup();
+    CLOSE_HANDLE(mutex_log);
+    CLOSE_HANDLE(mutex_ssl_io);
 }
 
 void cf_token_replace(char* str)
@@ -1138,22 +1164,23 @@ int ssl_write(const void *buf, int len)
 {
     if (ssl_io_result > 0)
     {
+        const char *cur_buf = (const char *) buf;
+        int remaining = len;
         int io_loop = 0;
 
         for (;;)
         {
-            print_log("SSL WRITE START loop=%d, len=%d", io_loop, len);
+            print_log("SSL WRITE START loop=%d, len=%d", io_loop, remaining);
             if (WaitForSingleObject(mutex_ssl_io, INFINITE) != WAIT_OBJECT_0)
             {
                 print_log("SSL WRITE MUTEX ERROR");
                 return -3;
             }
 
-            int result = SSL_write(ssl, buf, len);
+            int result = SSL_write(ssl, cur_buf, remaining);
             int error = SSL_get_error(ssl, result);
             int winsock_error = 0;
 
-// xxx if result != len
             switch (error)
             {
                 case SSL_ERROR_WANT_WRITE:
@@ -1178,7 +1205,6 @@ int ssl_write(const void *buf, int len)
                     log_ssl_error(result);
                     if (result == -1 && error == SSL_ERROR_SYSCALL && !winsock_error)
                     {
-                        // xxx retry
                         print_log("ssl_write null error retry");
                         io_loop++;
                     }
@@ -1190,8 +1216,22 @@ int ssl_write(const void *buf, int len)
                     break;
                 case SSL_ERROR_NONE:
                     packet_send_time = time(NULL);
-                    ssl_io_result = (result == len ? result : 0);
-                    io_loop = 0;
+                    if (result == remaining)
+                    {
+                        ssl_io_result = len;
+                        io_loop = 0;
+                    }
+                    else if (result > 0)
+                    {
+                        cur_buf += result;
+                        remaining -= result;
+                        io_loop++;
+                    }
+                    else
+                    {
+                        ssl_io_result = 0;
+                        io_loop = 0;
+                    }
                     break;
                 default:
                     print_log("SSL_write unknown error %d %d", error, io_loop);
@@ -1255,10 +1295,8 @@ int ssl_read(void *buf, int len)
                     log_ssl_error(result);
                     if (result == -1 && error == SSL_ERROR_SYSCALL && !winsock_error)
                     {
-                        // xxx retry
-                        print_log("ssl_read null error return");
-                        io_loop = 0;
-                        return -1;
+                        print_log("ssl_read null error retry");
+                        io_loop++;
                     }
                     else
                     {

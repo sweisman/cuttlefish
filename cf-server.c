@@ -26,6 +26,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
+#include <signal.h>
+
+#include "miniz.c"
 
 typedef struct
 {
@@ -59,6 +62,8 @@ void set_pid(const char *control_path);
 int bind_port(s_cf_socket *cf_socket);
 int bind_uds(const char *control_path);
 char *get_arg(const char *buf, const int n, const int terminate);
+void shutdown_handler(void);
+static void sig_term(int sig);
 
 int main(int argc, char *argv[])
 {
@@ -70,7 +75,7 @@ int main(int argc, char *argv[])
     if (!cn && !(cn = strstr(env, " CN=")))
         return -2;
 
-    # this assumes that CN is at end of SSL_CLIENT_DN; better to look for CN=\w+
+    // this assumes that CN is at end of SSL_CLIENT_DN; better to look for CN=\w+
     strncpy(client_name, &cn[4], MAX_BUFFER_SIZE);
     char *client_name_check = strchr(client_name, '/');
     if (client_name_check)
@@ -86,15 +91,15 @@ int main(int argc, char *argv[])
                     // path for uds control files eg "/usr/var/stunnel/pipes"
                     strncpy(control_path, optarg, MAX_BUFFER_SIZE);
                     if (control_path[strlen(control_path) - 1] != '/')
-                        strncat(control_path, "/", MAX_BUFFER_SIZE);
+                        strncat(control_path, "/", sizeof(control_path) - strlen(control_path) - 1);
                     break;
 
                 case 'l':
                     // log dir eg "/var/log/stunnel"
                     strncpy(log_file, optarg, MAX_BUFFER_SIZE);
-                    strncat(log_file, "/cf-", MAX_BUFFER_SIZE);
-                    strncat(log_file, client_name, MAX_BUFFER_SIZE);
-                    strncat(log_file, ".log", MAX_BUFFER_SIZE);
+                    strncat(log_file, "/cf-", sizeof(log_file) - strlen(log_file) - 1);
+                    strncat(log_file, client_name, sizeof(log_file) - strlen(log_file) - 1);
+                    strncat(log_file, ".log", sizeof(log_file) - strlen(log_file) - 1);
                     break;
             }
         }
@@ -106,7 +111,7 @@ int main(int argc, char *argv[])
         return -3;
     }
 
-    strncat(control_path, client_name, MAX_BUFFER_SIZE);
+    strncat(control_path, client_name, sizeof(control_path) - strlen(control_path) - 1);
 
     result = remove(control_path);
 
@@ -138,6 +143,10 @@ int main(int argc, char *argv[])
     }
 
     set_pid(control_path);
+
+    atexit(shutdown_handler);
+    signal(SIGTERM, sig_term);
+    signal(SIGPIPE, SIG_IGN);
 
     print_log("main: cf-server launched for client '%s'", client_name);
     print_log("main: all sanity checks passed; entering event loop");
@@ -201,14 +210,6 @@ int main(int argc, char *argv[])
 
     print_log("main: event loop terminated; cleaning up");
 
-// xxx move shutdown code to atexit() function
-    for (unsigned int pos = 0; pos <= cf_socket_idx; pos++)
-        if (cf_socket_list[pos])
-            cf_socket_free(cf_socket_list[pos]);
-
-    unlink(control_path);
-    remove(control_path);
-
     return 0;
 }
 
@@ -246,7 +247,9 @@ int event_handle(fd_set *p_fd_list)
 
         for (;;)
         {
-// xxx is this select() even needed? always wait for a complete packet to be received
+            // select() guards subsequent loop iterations: if the first read delivered
+            // a partial packet, we wait here for more data before retrying read().
+            // Without it, the blocking read() would stall indefinitely.
             int          high_fd;
             fd_set       fd_list;
 
@@ -297,31 +300,45 @@ int event_handle(fd_set *p_fd_list)
                 else
                     print_log("event_handle: client-side packet with bad id");
                 break;
+            case CF_PACKET_COMPRESSED_DATA:
             case CF_PACKET_DATA:
+            {
+                const char *pkt_payload = (const char *) PACKET_PAYLOAD(cf_packet);
+                int pkt_len = cf_packet->len;
+                static unsigned char decomp_buf[MAX_BUFFER_SIZE];
+
+                if (cf_packet->type == CF_PACKET_COMPRESSED_DATA)
+                {
+                    mz_ulong dest_len = sizeof(decomp_buf);
+                    if (mz_uncompress(decomp_buf, &dest_len, (const unsigned char *) pkt_payload, (mz_ulong) pkt_len) != MZ_OK)
+                    {
+                        print_log("event_handle: decompress error id=%d", cf_packet->id);
+                        break;
+                    }
+                    pkt_payload = (const char *) decomp_buf;
+                    pkt_len = (int) dest_len;
+                }
+
                 print_log("event_handle: client-side data");
 // xxx end semaphore if exec socket
                 if ((cf_socket = cf_socket_find(cf_packet->id)))
                 {
                     if (cf_socket->accept_socket)
                     {
-                        cf_socket->receive_count += cf_packet->len;
-                        send_buffer(cf_socket->accept_socket, (const char *) PACKET_PAYLOAD(cf_packet), cf_packet->len);
+                        cf_socket->receive_count += pkt_len;
+                        send_buffer(cf_socket->accept_socket, pkt_payload, pkt_len);
                     }
                     else
                     {
-// xxx if accept_socket not set yet, then put packet back on queue
-// if !queue_check() then set break_while_loop = 1;
-// queue_put(cf_socket, PACKET_SIZE(cf_socket));
-// if break_while_loop then break out of loop to avoid processing the packet over and over
-// xxx problem if this messes up packet order for the stream; solution will be to redesign packet queue
                         print_log("event_handle: no accept_socket for client-side data");
-                        queue_put(cf_socket, PACKET_SIZE(cf_packet));
+                        queue_put(cf_packet, PACKET_SIZE(cf_packet));
                         queue_loop_exit = 1;
                     }
                 }
                 else
                     print_log("event_handle: client-side packet with bad id");
                 break;
+            }
             case CF_PACKET_PING:
                 print_log("event_handle: client-side ping");
                 break;
@@ -387,7 +404,15 @@ int event_handle_control(int control_accept, char *buf)
 {
     char         msg[MAX_BUFFER_SIZE];
     s_cf_socket *cf_socket;
-    char        *arg = strchr(buf, ' ') + 1;
+    char        *arg = strchr(buf, ' ');
+
+    if (!arg)
+    {
+        send_buffer(control_accept, "ERROR INVALID COMMAND\n", -1);
+        return 0;
+    }
+
+    arg++;
 
     if (buf[0] == 'C' && buf[1] == 'O')
     {
@@ -397,13 +422,11 @@ int event_handle_control(int control_accept, char *buf)
 
         if ((cf_socket = cf_socket_new()))
         {
-// xxx check arg != NULL
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
             strncpy(cf_socket->payload, get_arg(arg, 1, 1), MAX_BUFFER_SIZE);
             cf_socket->remote_port = atoi(get_arg(arg, 2, 1));
-// xxx check payload and local_port and remote_port
 
-            if (!cf_socket->remote_port || bind_port(cf_socket))
+            if (!cf_socket->remote_port || !cf_socket->payload[0] || bind_port(cf_socket))
             {
                 send_buffer(control_accept, "CONNECT FAIL\n", -1);
                 cf_socket_free(cf_socket);
@@ -428,13 +451,11 @@ int event_handle_control(int control_accept, char *buf)
 
         if ((cf_socket = cf_socket_new()))
         {
-// xxx check arg != NULL
             cf_socket->type = CF_SOCKET_EXEC;
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
             strncpy(cf_socket->payload, get_arg(arg, 1, 0), MAX_BUFFER_SIZE);
-// xxx check payload and local_port
 
-            if (bind_port(cf_socket))
+            if (!cf_socket->payload[0] || bind_port(cf_socket))
             {
                 send_buffer(control_accept, "EXEC FAIL\n", -1);
                 cf_socket_free(cf_socket);
@@ -443,12 +464,8 @@ int event_handle_control(int control_accept, char *buf)
             {
                 sprintf(msg, "EXEC SUCCESS %d\n", cf_socket->local_port);
                 send_buffer(control_accept, msg, -1);
+                send_packet(cf_socket->id, CF_PACKET_EXEC, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
             }
-
-            // send exec packet here not below because we always want to run the program
-            // xxx this is a potential race condition because we could get back data from the exec
-            // xxx before the local side connects to the listening socket
-// xxx set exec semaphore here
         }
         else
         {
@@ -464,13 +481,11 @@ int event_handle_control(int control_accept, char *buf)
 
         if ((cf_socket = cf_socket_new()))
         {
-// xxx check arg != NULL
             cf_socket->type = CF_SOCKET_FILE;
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
             strncpy(cf_socket->payload, get_arg(arg, 1, 0), MAX_BUFFER_SIZE);
-// xxx check payload and local_port
 
-            if (bind_port(cf_socket))
+            if (!cf_socket->payload[0] || bind_port(cf_socket))
             {
                 send_buffer(control_accept, "FILE FAIL\n", -1);
                 cf_socket_free(cf_socket);
@@ -479,6 +494,7 @@ int event_handle_control(int control_accept, char *buf)
             {
                 sprintf(msg, "FILE SUCCESS %d\n", cf_socket->local_port);
                 send_buffer(control_accept, msg, -1);
+                send_packet(cf_socket->id, CF_PACKET_FILE, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
             }
         }
         else
@@ -546,23 +562,36 @@ void event_handle_local_accept(s_cf_socket *cf_socket)
         print_log("event_handle_local_accept: accept %d from listen socket", cf_socket->accept_socket);
         print_log("event_handle_local_accept: setting upstream tunnel for accept socket %d", cf_socket->accept_socket);
 
+        // Drain any DATA that arrived before the caller connected
+        {
+            s_cf_packet *queued;
+            while ((queued = queue_get()))
+            {
+                if (queued->type == CF_PACKET_DATA && queued->id == cf_socket->id)
+                {
+                    cf_socket->receive_count += queued->len;
+                    send_buffer(cf_socket->accept_socket, (const char *) PACKET_PAYLOAD(queued), queued->len);
+                }
+                else
+                {
+                    queue_put(queued, PACKET_SIZE(queued));
+                    break;
+                }
+            }
+        }
+
         switch (cf_socket->type)
         {
             case CF_SOCKET_PING:
                 // ping has no listen socket; do nothing here
                 // xxx in fact, this is an error
                 break;
-            case CF_SOCKET_EXEC:
-                send_packet(cf_socket->id, CF_PACKET_EXEC, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
-                break;
-            case CF_SOCKET_FILE:
-                send_packet(cf_socket->id, CF_PACKET_FILE, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
-                break;
             default:
                 if (cf_socket->remote_port)
                 {
                     char payload[MAX_BUFFER_SIZE];
-                    send_packet(cf_socket->id, CF_PACKET_CONNECT, (void *) payload, sprintf(payload, "%s:%d", cf_socket->payload, cf_socket->remote_port) + 1);
+                    int payload_len = snprintf(payload, sizeof(payload), "%s:%d", cf_socket->payload, cf_socket->remote_port);
+                    send_packet(cf_socket->id, CF_PACKET_CONNECT, (void *) payload, payload_len + 1);
                 }
                 break;
         }
@@ -593,7 +622,7 @@ void event_handle_local_data(s_cf_socket *cf_socket)
         {
             print_log("event_handle_local_data: server-side data received %d", result);
             cf_socket->send_count += result;
-            send_packet(cf_socket->id, CF_PACKET_DATA, buf, result);
+            send_compressed_packet(cf_socket->id, buf, result);
         }
 
         if (++count > 4)
@@ -651,7 +680,7 @@ void set_pid(const char *control_path)
 {
     char pid_path[MAX_BUFFER_SIZE] = "";
     strncpy(pid_path, control_path, MAX_BUFFER_SIZE);
-    strncat(pid_path, ".pid", MAX_BUFFER_SIZE);
+    strncat(pid_path, ".pid", sizeof(pid_path) - strlen(pid_path) - 1);
     FILE *pid_fd = fopen(pid_path, "w");
     fprintf(pid_fd, "%d", getpid());
     fflush(pid_fd);
@@ -784,6 +813,25 @@ int do_select(int high_fd, fd_set *read_list, int usec, char *msg)
     }
 
     return result;
+}
+
+void shutdown_handler(void)
+{
+    for (unsigned int pos = 0; pos <= cf_socket_idx; pos++)
+        if (cf_socket_list[pos])
+            cf_socket_free(cf_socket_list[pos]);
+
+    if (control_path[0])
+    {
+        unlink(control_path);
+        remove(control_path);
+    }
+}
+
+static void sig_term(int sig)
+{
+    (void) sig;
+    exit(0);
 }
 
 /*

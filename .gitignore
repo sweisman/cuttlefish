@@ -50,3 +50,14 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Project-local developer files
+CLAUDE.md
+
+# Downloaded dependencies (miniz amalgamation)
+miniz.h
+miniz.c
+
+# Compiled server binaries
+cf-server
+cf-server32

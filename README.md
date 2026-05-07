@@ -46,7 +46,7 @@ A single server can easily support many thousands of active client connections.
 -w: working directory
 -l: log file
 -s: public server certificate file
--c: public client certificate file
+-c: client certificate+key PEM file (the combined key.pem generated during cert setup)
 ```
 
 ### Server Certificate
@@ -209,12 +209,33 @@ i686-w64-mingw32-strip -g lib*.a
 
 Library files libcrypto.a and libssl.a are static; libeay32.a and libssl32.a are dynamic
 
+#### Getting miniz
+
+The client and server both depend on [miniz](https://github.com/richgel999/miniz) for compression.
+The build requires the amalgamated single-file form, which is generated from the source using CMake:
+
+```
+curl -fL -o /tmp/miniz-main.zip \
+  https://github.com/richgel999/miniz/archive/refs/heads/master.zip
+unzip -d /tmp/miniz_src /tmp/miniz-main.zip
+cd /tmp/miniz_src/miniz-master
+cmake -S. -B_build -DAMALGAMATE_SOURCES=ON -G"Unix Makefiles"
+cp _build/amalgamation/miniz.h _build/amalgamation/miniz.c /path/to/cuttlefish/
+```
+
+The two output files (`miniz.h`, `miniz.c`) are included directly into the build via `#include "miniz.c"` — no separate compilation or linking step is needed.
+
 #### Building the Client
 
 Cross-compile on Linux:
 ```
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /opt/cmf/src/cf/include cf-client-win.c XGetopt.c -o Cuttlefish.exe -L /opt/cmf/src/cf/lib -lssl -lcrypto -lcrypt32 -lws2_32 -lgdi32 -Wl,--subsystem,console
 i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static                            cf-client-win.c XGetopt.c -o Cuttlefish.exe -lssl -lcrypto -lws2_32 -lgdi32 -ladvapi32 -lcrypt32 -luser32 -static-libgcc -shared -Wl,--subsystem,console
+```
+
+To build the APRO (security-hardened) variant, substitute `cf-client-win-apro.c` for `cf-client-win.c`:
+```
+i686-w64-mingw32-gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os -s -static -I /opt/cmf/src/cf/include cf-client-win-apro.c XGetopt.c -o CuttlefishApro.exe -L /opt/cmf/src/cf/lib -lssl -lcrypto -lcrypt32 -lws2_32 -lgdi32 -Wl,--subsystem,console
 ```
 
 ##### With CYASSL (similar for WolfSSL)

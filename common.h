@@ -15,6 +15,7 @@ typedef struct
 
 #define MAX_PACKET_SIZE            (MAX_BUFFER_SIZE + sizeof(s_cf_packet))
 #define QUEUE_BUFFER_SIZE          (MAX_PACKET_SIZE * 64)
+#define COMP_BOUND_MAX             (MAX_BUFFER_SIZE + (MAX_BUFFER_SIZE / 1000) + 14)
 
 #define clear(buf, len)            memset((buf), 0, (len))
 #define allot(len)                 memset((malloc(len)), 0, (len))
@@ -26,7 +27,7 @@ typedef struct
 #define CF_PACKET_DISCONNECT        3
 #define CF_PACKET_DATA              4
 #define CF_PACKET_EXEC              5
-// #define CF_PACKET_COMPRESSED_DATA   6 xxx not used
+#define CF_PACKET_COMPRESSED_DATA   6
 #define CF_PACKET_FILE              7
 #define CF_PACKET_MESSAGE           8
 #define CF_PACKET_LOG               9
@@ -39,7 +40,7 @@ typedef struct
 
 #define CF_SOCKET_MAX               (FD_SETSIZE - 2) // FD_SETSIZE - 1 (for stdin) - 1 (for control socket)
 
-const char  *packet_type[] = {"error0", "PING", "CONNECT", "DISCONNECT", "DATA", "EXEC", "error1", "FILE", "MESSAGE", "LOG"};
+const char  *packet_type[] = {"error0", "PING", "CONNECT", "DISCONNECT", "DATA", "EXEC", "COMPRESSED_DATA", "FILE", "MESSAGE", "LOG"};
 char         log_file[MAX_BUFFER_SIZE] = "";
 uint32_t     cf_socket_idx = 0;
 s_cf_socket *cf_socket_list[CF_SOCKET_MAX];
@@ -123,6 +124,18 @@ int send_packet(uint32_t id, int8_t type, LPVOID data, int len)
     return result;
 }
 
+int send_compressed_packet(uint32_t id, LPVOID data, int len)
+{
+    mz_ulong comp_len = COMP_BOUND_MAX;
+    unsigned char comp_buf[COMP_BOUND_MAX];
+
+    if (mz_compress2(comp_buf, &comp_len, (const unsigned char *) data, (mz_ulong) len, MZ_DEFAULT_COMPRESSION) == MZ_OK &&
+        comp_len < (mz_ulong) len)
+        return send_packet(id, CF_PACKET_COMPRESSED_DATA, comp_buf, (int) comp_len);
+
+    return send_packet(id, CF_PACKET_DATA, data, len);
+}
+
 void cf_socket_dump(void)
 {
     s_cf_socket *cf_socket;
@@ -164,8 +177,8 @@ void cf_socket_free(s_cf_socket *cf_socket)
             if (cf_socket->socket)
                 close_socket(cf_socket->socket);
 
-            if (cf_socket->fp)
-                fclose(cf_socket->fp);
+            if (cf_socket->hFile)
+                CloseHandle(cf_socket->hFile);
 
             if (cf_socket->hThread)
             {
@@ -204,8 +217,9 @@ s_cf_socket *cf_socket_new(
 {
 #if defined(CF_SERVER)
     static uint32_t id = 0;
+    do { id++; } while (id == 0 || cf_socket_find(id));
 #elif defined(CF_CLIENT_WIN)
-    // xxx this stupid check is here because cf-server currently reuses ids!
+    // Belt-and-suspenders: server guarantees unique IDs, but guard against future regressions.
     s_cf_socket *cf_socket = cf_socket_find(id);
 
     if (cf_socket)
@@ -228,7 +242,7 @@ s_cf_socket *cf_socket_new(
 #if defined(CF_CLIENT_WIN)
                 cf_socket_list[i]->id = id;
 #elif defined(CF_SERVER)
-                cf_socket_list[i]->id = ++id;
+                cf_socket_list[i]->id = id;
 #endif
                 print_log("SOCKET NEW id=%d, idx=%d, idx_max=%d", cf_socket_list[i]->id, i, cf_socket_idx);
                 return cf_socket_list[i];
