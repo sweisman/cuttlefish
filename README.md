@@ -256,4 +256,4 @@ gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -Os cf-server.c -o cf-server
 gcc -static -m32 -Wall -Wextra -pedantic -std=gnu99 -Werror -Os cf-server.c -o cf-server32
 ```
 
-The `installer` directory includes a basic [NSIS](https://nsis.sourceforge.io/) installer script.
+The `installer` directory includes a basic [Inno Setup](https://jrsoftware.org/isinfo.php) installer script.
