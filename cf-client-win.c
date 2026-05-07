@@ -39,6 +39,7 @@ typedef struct
     unsigned int        receive_count;
     unsigned char       terminate;
     unsigned char       disconnect;
+    unsigned char       compress;
 
     // CONNECT
     SOCKET              socket;
@@ -335,11 +336,12 @@ int event_handle(void)
             break;
 
         case CF_PACKET_CONNECT:
-            print_log("EVENT HANDLE CONNECT: '%s'", (cf_packet + 1));
+            print_log("EVENT HANDLE CONNECT: '%s'", payload + 1);
 
             if ((cf_socket = cf_socket_new(cf_packet->id)))
             {
-                char *connect_addr = (char *) (cf_packet + 1);
+                cf_socket->compress = (unsigned char)payload[0] & 0x01;
+                char *connect_addr = payload + 1;
                 char *connect_port = strchr(connect_addr, ':');
 
                 if (!connect_port)
@@ -383,7 +385,8 @@ int event_handle(void)
         case CF_PACKET_EXEC:
             if ((cf_socket = cf_socket_new(cf_packet->id)))
             {
-                strncpy(cf_socket->payload, payload, MAX_BUFFER_SIZE);
+                cf_socket->compress = (unsigned char)payload[0] & 0x01;
+                strncpy(cf_socket->payload, payload + 1, MAX_BUFFER_SIZE);
                 cf_socket->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
                 if (!(cf_socket->hThread = (HANDLE) _beginthreadex(NULL, 0, cf_exec, (LPVOID) cf_socket, 0, &cf_socket->thread_id)))
                 {
@@ -398,23 +401,27 @@ int event_handle(void)
             break;
 
         case CF_PACKET_FILE:
-            if (!_stat(payload, &stat_buf))
             {
-                // file exists - for file sending only
-                print_log("    EVENT HANDLE FILE READ");
-                file_op = "rb";
-            }
-            else
-            {
-                // no file - for file receiving only
-                print_log("    EVENT HANDLE FILE WRITE");
-                file_op = "wb";
-            }
+                unsigned char pkt_compress = (unsigned char)payload[0] & 0x01;
+                const char *file_path = payload + 1;
+                if (!_stat(file_path, &stat_buf))
+                {
+                    // file exists - for file sending only
+                    print_log("    EVENT HANDLE FILE READ");
+                    file_op = "rb";
+                }
+                else
+                {
+                    // no file - for file receiving only
+                    print_log("    EVENT HANDLE FILE WRITE");
+                    file_op = "wb";
+                }
 
-            if ((cf_socket = cf_socket_new(cf_packet->id)))
-            {
-                strncpy(cf_socket->payload, payload, MAX_BUFFER_SIZE);
-                cf_token_replace(cf_socket->payload);
+                if ((cf_socket = cf_socket_new(cf_packet->id)))
+                {
+                    cf_socket->compress = pkt_compress;
+                    strncpy(cf_socket->payload, file_path, MAX_BUFFER_SIZE);
+                    cf_token_replace(cf_socket->payload);
 
                 print_log("    EVENT HANDLE TYPE: FILE payload={%s}", cf_socket->payload);
 
@@ -454,6 +461,7 @@ int event_handle(void)
             }
             else
                 print_log("    EVENT HANDLE ERROR: NO FREE SOCKET id=%d", cf_packet->id);
+            }
             break;
 
         case CF_PACKET_COMPRESSED_DATA:
@@ -584,7 +592,9 @@ unsigned __stdcall cf_connect(LPVOID arg)
                     print_log("CONNECT READ ERROR: ssl_pending id=%d", cf_socket->id);
                     break;
                 }
-                else if (send_compressed_packet(cf_socket->id, buffer, result))
+                else if (cf_socket->compress
+                             ? send_compressed_packet(cf_socket->id, buffer, result)
+                             : send_packet(cf_socket->id, CF_PACKET_DATA, buffer, result))
                 {
                     print_log("CONNECT READ ERROR: READ LOCAL SEND id=%d", cf_socket->id);
                     break;
@@ -719,7 +729,9 @@ unsigned __stdcall cf_exec(LPVOID arg)
                                 print_log("EXEC READ ERROR: ssl_pending id=%d", cf_socket->id);
                                 break;
                             }
-                            else if ((result = send_compressed_packet(cf_socket->id, buffer, read_len)))
+                            else if ((result = (cf_socket->compress
+                                                    ? send_compressed_packet(cf_socket->id, buffer, read_len)
+                                                    : send_packet(cf_socket->id, CF_PACKET_DATA, buffer, read_len))))
                             {
                                 print_log("        EXEC ERROR BAD SEND PACKET id=%d", cf_socket->id);
                                 log_socket_error(cf_socket, GetLastError(), "EXEC READ");
@@ -841,7 +853,9 @@ unsigned __stdcall cf_file_read(LPVOID arg)
             print_log("FILE READ ERROR: ssl_pending id=%d", cf_socket->id);
             break;
         }
-        else if (send_compressed_packet(cf_socket->id, buffer, (int) read_len))
+        else if (cf_socket->compress
+                     ? send_compressed_packet(cf_socket->id, buffer, (int) read_len)
+                     : send_packet(cf_socket->id, CF_PACKET_DATA, buffer, (int) read_len))
         {
             print_log("        FILE READ ERROR BAD SEND PACKET id=%d", cf_socket->id);
             break;

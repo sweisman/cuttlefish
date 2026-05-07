@@ -37,6 +37,7 @@ A single server can easily support many thousands of active client connections.
 ```
 -p: command pipe dir (where the unix domain socket is opened to control the connection)
 -l: log dir (very detailed logging of each connection)
+-z: legacy mode — disables compression for clients that predate compressed packet support
 ```
 
 ### Client Parameters
@@ -132,19 +133,41 @@ execargs = /opt/myApp/bin/cf-server -p /opt/myApp/pipes/
 ;execargs = /opt/myApp/bin/cf-server -p /opt/myApp/pipes/ -l /opt/myApp/log
 ```
 
+To support a mix of updated and legacy clients, run two service blocks on different ports — one with `-z` for clients that predate compression support:
+
+```
+[CF]
+client = no
+accept = 1163
+verify = 3
+...
+exec = /opt/myApp/bin/cf-server
+execargs = /opt/myApp/bin/cf-server -p /opt/myApp/pipes/
+
+[CF-legacy]
+client = no
+accept = 1164
+verify = 3
+...
+exec = /opt/myApp/bin/cf-server
+execargs = /opt/myApp/bin/cf-server -p /opt/myApp/pipes-legacy/ -z
+```
+
 Each connection from a client creates a Unix Domain Socket in the `-p` directory, where `commonName` is used as the file name.
 
 It accepts the following plain text commands to initiate activity on the client:
 ```
-CONNECT _LOCAL_PORT_ _REMOTE_DOMAIN_ _REMOTE_PORT_
+CONNECT _LOCAL_PORT_ [--compress] _REMOTE_DOMAIN_ _REMOTE_PORT_
 eg "CONNECT 3389 localhost 3389" # RDP Remote Desktop access
 
-EXEC _LOCAL_PORT_ _REMOTE_COMMAND_TO_EXECUTE_
+EXEC _LOCAL_PORT_ [--compress] _REMOTE_COMMAND_TO_EXECUTE_
 eg 'EXEC 0 cmd /C dir /l /b /ad "C:\Program Files\"'
 
-FILE _LOCAL_PORT_ _SOURCE_OR_DEST_TO_TRANSFER_
+FILE _LOCAL_PORT_ [--compress] _SOURCE_OR_DEST_TO_TRANSFER_
 eg "FILE 0 c:\tmp.txt" # if file c:\tmp.txt exists, transfer to server, else transfer to client and create it
 ```
+
+The optional `--compress` flag enables zlib compression for that operation's data channel (both directions). Compression is off by default — use it only when the data is not already compressed. Not available when the server is running in legacy mode (`-z`).
 
 For the above commands, the `0` means to randomly pick a local port to use for sending and receiving data. Alternatively, specify a port.
 The response to the command includes the local port on the server opened for listening to interact with the client and send/receive data.

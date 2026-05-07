@@ -2,9 +2,8 @@
  * CuttleFish Server
  * Copyright (C) Scott Weisman
  *
- * Designed to be spawned by stunnel (or any STDIO-based SSL wrapper:
- * ucspi-ssl, ipsvd, nosh, s6-tlsserver). Traffic is via STDIO; control
- * is through a Unix domain socket file.
+ * Designed to be spawned by stunnel (or any STDIO-based SSL wrapper: ucspi-ssl, ipsvd, nosh, s6-tlsserver).
+ * Traffic is via STDIO; control is through a Unix domain socket file.
  */
 
 #define CF_SERVER
@@ -44,6 +43,7 @@ typedef struct
     uint16_t      remote_port;
     unsigned char *pending_buf;
     int           pending_len;
+    unsigned char compress;
 } s_cf_socket;
 
 char        client_name[MAX_BUFFER_SIZE] = "";
@@ -51,6 +51,7 @@ const char  *VERSION = "v4.0";
 char        control_path[MAX_BUFFER_SIZE] = "";
 int         control_listen, tunnel_in, tunnel_out;
 time_t      packet_read_time, packet_send_time;
+int         legacy_mode = 0;
 
 int send_buffer(int socket, const char *buf, int len);
 
@@ -84,8 +85,13 @@ int main(int argc, char *argv[])
     if (client_name_check)
         *client_name_check = 0;
 
-    while ((opt = getopt(argc, argv, "p:l:")) != -1)
+    while ((opt = getopt(argc, argv, "p:l:z")) != -1)
     {
+        if (opt == 'z')
+        {
+            legacy_mode = 1;
+            continue;
+        }
         if (optarg)
         {
             switch (opt)
@@ -249,6 +255,7 @@ int event_handle(fd_set *p_fd_list)
             // select() guards subsequent loop iterations: if the first read delivered
             // a partial packet, we wait here for more data before retrying read().
             // Without it, the blocking read() would stall indefinitely.
+
             int          high_fd;
             fd_set       fd_list;
 
@@ -426,8 +433,14 @@ int event_handle_control(int control_accept, char *buf)
         if ((cf_socket = cf_socket_new()))
         {
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
-            strncpy(cf_socket->payload, get_arg(arg, 1, 1), MAX_BUFFER_SIZE);
-            cf_socket->remote_port = atoi(get_arg(arg, 2, 1));
+            int host_offset = 0;
+            if (!legacy_mode && strcmp(get_arg(arg, 1, 1), "--compress") == 0)
+            {
+                cf_socket->compress = 1;
+                host_offset = 1;
+            }
+            strncpy(cf_socket->payload, get_arg(arg, 1 + host_offset, 1), MAX_BUFFER_SIZE);
+            cf_socket->remote_port = atoi(get_arg(arg, 2 + host_offset, 1));
 
             if (!cf_socket->remote_port || !cf_socket->payload[0] || bind_port(cf_socket))
             {
@@ -456,7 +469,13 @@ int event_handle_control(int control_accept, char *buf)
         {
             cf_socket->type = CF_SOCKET_EXEC;
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
-            strncpy(cf_socket->payload, get_arg(arg, 1, 0), MAX_BUFFER_SIZE);
+            int cmd_offset = 0;
+            if (!legacy_mode && strcmp(get_arg(arg, 1, 1), "--compress") == 0)
+            {
+                cf_socket->compress = 1;
+                cmd_offset = 1;
+            }
+            strncpy(cf_socket->payload, get_arg(arg, 1 + cmd_offset, 0), MAX_BUFFER_SIZE);
 
             if (!cf_socket->payload[0] || bind_port(cf_socket))
             {
@@ -467,7 +486,17 @@ int event_handle_control(int control_accept, char *buf)
             {
                 sprintf(msg, "EXEC SUCCESS %d\n", cf_socket->local_port);
                 send_buffer(control_accept, msg, -1);
-                send_packet(cf_socket->id, CF_PACKET_EXEC, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
+                if (legacy_mode)
+                {
+                    send_packet(cf_socket->id, CF_PACKET_EXEC, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
+                }
+                else
+                {
+                    char flagged[1 + MAX_BUFFER_SIZE];
+                    flagged[0] = cf_socket->compress & 0x01;
+                    strncpy(flagged + 1, cf_socket->payload, MAX_BUFFER_SIZE);
+                    send_packet(cf_socket->id, CF_PACKET_EXEC, flagged, (int) strlen(cf_socket->payload) + 2);
+                }
             }
         }
         else
@@ -486,7 +515,13 @@ int event_handle_control(int control_accept, char *buf)
         {
             cf_socket->type = CF_SOCKET_FILE;
             cf_socket->local_port = atoi(get_arg(arg, 0, 1));
-            strncpy(cf_socket->payload, get_arg(arg, 1, 0), MAX_BUFFER_SIZE);
+            int path_offset = 0;
+            if (!legacy_mode && strcmp(get_arg(arg, 1, 1), "--compress") == 0)
+            {
+                cf_socket->compress = 1;
+                path_offset = 1;
+            }
+            strncpy(cf_socket->payload, get_arg(arg, 1 + path_offset, 0), MAX_BUFFER_SIZE);
 
             if (!cf_socket->payload[0] || bind_port(cf_socket))
             {
@@ -497,7 +532,17 @@ int event_handle_control(int control_accept, char *buf)
             {
                 sprintf(msg, "FILE SUCCESS %d\n", cf_socket->local_port);
                 send_buffer(control_accept, msg, -1);
-                send_packet(cf_socket->id, CF_PACKET_FILE, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
+                if (legacy_mode)
+                {
+                    send_packet(cf_socket->id, CF_PACKET_FILE, (void *) cf_socket->payload, strlen(cf_socket->payload) + 1);
+                }
+                else
+                {
+                    char flagged[1 + MAX_BUFFER_SIZE];
+                    flagged[0] = cf_socket->compress & 0x01;
+                    strncpy(flagged + 1, cf_socket->payload, MAX_BUFFER_SIZE);
+                    send_packet(cf_socket->id, CF_PACKET_FILE, flagged, (int) strlen(cf_socket->payload) + 2);
+                }
             }
         }
         else
@@ -584,9 +629,19 @@ void event_handle_local_accept(s_cf_socket *cf_socket)
             default:
                 if (cf_socket->remote_port)
                 {
-                    char payload[MAX_BUFFER_SIZE];
-                    int payload_len = snprintf(payload, sizeof(payload), "%s:%d", cf_socket->payload, cf_socket->remote_port);
-                    send_packet(cf_socket->id, CF_PACKET_CONNECT, (void *) payload, payload_len + 1);
+                    if (legacy_mode)
+                    {
+                        char payload[MAX_BUFFER_SIZE];
+                        int payload_len = snprintf(payload, sizeof(payload), "%s:%d", cf_socket->payload, cf_socket->remote_port);
+                        send_packet(cf_socket->id, CF_PACKET_CONNECT, (void *) payload, payload_len + 1);
+                    }
+                    else
+                    {
+                        char flagged[1 + MAX_BUFFER_SIZE];
+                        flagged[0] = cf_socket->compress & 0x01;
+                        int str_len = snprintf(flagged + 1, MAX_BUFFER_SIZE, "%s:%d", cf_socket->payload, cf_socket->remote_port);
+                        send_packet(cf_socket->id, CF_PACKET_CONNECT, flagged, str_len + 2);
+                    }
                 }
                 break;
         }
@@ -617,7 +672,10 @@ void event_handle_local_data(s_cf_socket *cf_socket)
         {
             print_log("event_handle_local_data: server-side data received %d", result);
             cf_socket->send_count += result;
-            send_compressed_packet(cf_socket->id, buf, result);
+            if (!legacy_mode && cf_socket->compress)
+                send_compressed_packet(cf_socket->id, buf, result);
+            else
+                send_packet(cf_socket->id, CF_PACKET_DATA, buf, result);
         }
 
         if (++count > 4)
