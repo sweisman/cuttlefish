@@ -2,8 +2,9 @@
  * CuttleFish Server
  * Copyright (C) Scott Weisman
  *
- * this program is meant to be invoked by stunnel
- * traffic is via stdio; control is through a uds file
+ * Designed to be spawned by stunnel (or any STDIO-based SSL wrapper:
+ * ucspi-ssl, ipsvd, nosh, s6-tlsserver). Traffic is via STDIO; control
+ * is through a Unix domain socket file.
  */
 
 #define CF_SERVER
@@ -32,15 +33,17 @@
 
 typedef struct
 {
-    uint32_t     id;
-    int8_t       type;
-    int          accept_socket;
-    int          listen_socket;
-    char         payload[MAX_BUFFER_SIZE];
-    unsigned int send_count;
-    unsigned int receive_count;
-    uint16_t     local_port;
-    uint16_t     remote_port;
+    uint32_t      id;
+    int8_t        type;
+    int           accept_socket;
+    int           listen_socket;
+    char          payload[MAX_BUFFER_SIZE];
+    unsigned int  send_count;
+    unsigned int  receive_count;
+    uint16_t      local_port;
+    uint16_t      remote_port;
+    unsigned char *pending_buf;
+    int           pending_len;
 } s_cf_socket;
 
 char        client_name[MAX_BUFFER_SIZE] = "";
@@ -280,9 +283,8 @@ int event_handle(fd_set *p_fd_list)
     }
 
     s_cf_packet *cf_packet;
-    int          queue_loop_exit = 0;
 
-    while (!queue_loop_exit && (cf_packet = queue_get()))
+    while ((cf_packet = queue_get()))
     {
         print_log("event_handle: client data id=%d, type=%d, len=%d", cf_packet->id, cf_packet->type, cf_packet->len);
 
@@ -330,9 +332,16 @@ int event_handle(fd_set *p_fd_list)
                     }
                     else
                     {
-                        print_log("event_handle: no accept_socket for client-side data");
-                        queue_put(cf_packet, PACKET_SIZE(cf_packet));
-                        queue_loop_exit = 1;
+                        unsigned char *new_buf = realloc(cf_socket->pending_buf, cf_socket->pending_len + pkt_len);
+                        if (new_buf)
+                        {
+                            print_log("event_handle: buffering %d bytes for id=%d (no accept_socket)", pkt_len, cf_socket->id);
+                            cf_socket->pending_buf = new_buf;
+                            memcpy(cf_socket->pending_buf + cf_socket->pending_len, pkt_payload, pkt_len);
+                            cf_socket->pending_len += pkt_len;
+                        }
+                        else
+                            print_log("event_handle: pending_buf realloc failed for id=%d", cf_socket->id);
                     }
                 }
                 else
@@ -562,22 +571,14 @@ void event_handle_local_accept(s_cf_socket *cf_socket)
         print_log("event_handle_local_accept: accept %d from listen socket", cf_socket->accept_socket);
         print_log("event_handle_local_accept: setting upstream tunnel for accept socket %d", cf_socket->accept_socket);
 
-        // Drain any DATA that arrived before the caller connected
+        if (cf_socket->pending_buf)
         {
-            s_cf_packet *queued;
-            while ((queued = queue_get()))
-            {
-                if (queued->type == CF_PACKET_DATA && queued->id == cf_socket->id)
-                {
-                    cf_socket->receive_count += queued->len;
-                    send_buffer(cf_socket->accept_socket, (const char *) PACKET_PAYLOAD(queued), queued->len);
-                }
-                else
-                {
-                    queue_put(queued, PACKET_SIZE(queued));
-                    break;
-                }
-            }
+            print_log("event_handle_local_accept: flushing %d pending bytes for id=%d", cf_socket->pending_len, cf_socket->id);
+            cf_socket->receive_count += cf_socket->pending_len;
+            send_buffer(cf_socket->accept_socket, (const char *) cf_socket->pending_buf, cf_socket->pending_len);
+            free(cf_socket->pending_buf);
+            cf_socket->pending_buf = NULL;
+            cf_socket->pending_len = 0;
         }
 
         switch (cf_socket->type)
@@ -834,6 +835,3 @@ static void sig_term(int sig)
     exit(0);
 }
 
-/*
- * xxx modify to work with http://www.fehcom.de/ipnet/ucspi-ssl.html or http://smarden.org/ipsvd/ or http://homepage.ntlworld.com/jonathan.deboynepollard/Softwares/nosh/ or netcat instead of stunnel
- */

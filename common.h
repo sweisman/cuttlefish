@@ -197,6 +197,8 @@ void cf_socket_free(s_cf_socket *cf_socket)
                 close(cf_socket->accept_socket);
             if (cf_socket->listen_socket > 0)
                 close(cf_socket->listen_socket);
+            if (cf_socket->pending_buf)
+                free(cf_socket->pending_buf);
 #endif
 
             clear(cf_socket, sizeof(s_cf_socket));
