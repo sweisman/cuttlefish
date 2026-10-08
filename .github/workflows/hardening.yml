@@ -1,0 +1,99 @@
+name: Hardening regressions
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare miniz amalgamation
+        run: |
+          curl --fail --location https://github.com/richgel999/miniz/archive/refs/tags/3.1.2.tar.gz --output /tmp/miniz.tar.gz
+          tar -xzf /tmp/miniz.tar.gz -C /tmp
+          cmake -S /tmp/miniz-3.1.2 -B /tmp/miniz-build -DAMALGAMATE_SOURCES=ON
+          cp /tmp/miniz-build/amalgamation/miniz.c /tmp/miniz-build/amalgamation/miniz.h .
+      - name: Compile with sanitizers
+        run: |
+          mkdir -p build
+          gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer cf-server.c -o build/cf-server
+          gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -g -O1 -fsanitize=address,undefined cf-protocol-test.c -o build/cf-protocol-test
+      - name: Run bounded corpus and server regressions
+        env:
+          CF_SERVER: ${{ github.workspace }}/build/cf-server
+          CF_TEST_TMP: /tmp
+        run: |
+          build/cf-protocol-test
+          python cf-hardening-tests.py
+          perl -c perl/lib/cf.pm
+          python -m py_compile bin/cfctl cf-client-tests.py
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: [openssl, wolfssl]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-openssl
+            curl
+            tar
+            autoconf
+            automake
+            libtool
+            make
+      - name: Prepare miniz amalgamation
+        run: |
+          curl --fail --location https://github.com/richgel999/miniz/archive/refs/tags/3.1.2.tar.gz --output /tmp/miniz.tar.gz
+          tar -xzf /tmp/miniz.tar.gz -C /tmp
+          cmake -S /tmp/miniz-3.1.2 -B /tmp/miniz-build -G Ninja -DAMALGAMATE_SOURCES=ON
+          cp /tmp/miniz-build/amalgamation/miniz.c /tmp/miniz-build/amalgamation/miniz.h .
+      - name: Build wolfSSL with its full OpenSSL compatibility API
+        if: matrix.tls == 'wolfssl'
+        run: |
+          curl --fail --location https://github.com/wolfssl/wolfssl/archive/v5.8.4-stable/wolfssl-5.8.4-stable.tar.gz --output /tmp/wolfssl.tar.gz
+          echo '2b702b7a66b0067bfd284408827b1e59288b357b0dd758d0089c062395f2a522  /tmp/wolfssl.tar.gz' > /tmp/wolfssl.sha256
+          sha256sum -c /tmp/wolfssl.sha256
+          tar -xzf /tmp/wolfssl.tar.gz -C /tmp
+          export CF_WOLF_PREFIX="$PWD/build/wolfssl"
+          cd /tmp/wolfssl-5.8.4-stable
+          ./autogen.sh
+          ./configure --host=x86_64-w64-mingw32 --enable-opensslall --enable-static --disable-shared --disable-examples --disable-crypttests --prefix="$CF_WOLF_PREFIX"
+          make -j2
+          make install
+      - name: Build both client variants
+        env:
+          TLS_LIBRARY: ${{ matrix.tls }}
+        run: |
+          mkdir -p build
+          flags=()
+          libs=(-lssl -lcrypto)
+          if [ "$TLS_LIBRARY" = wolfssl ]; then
+            flags=(-DCF_CYASSL -I"$PWD/build/wolfssl/include")
+            libs=(-L"$PWD/build/wolfssl/lib" -lwolfssl)
+          fi
+          gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -O1 "${flags[@]}" cf-client-win.c -o build/cf-client.exe "${libs[@]}" -lws2_32 -lcrypt32
+          gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -O1 -DCF_APRO "${flags[@]}" cf-client-win.c -o build/cf-apro.exe "${libs[@]}" -lws2_32 -lcrypt32
+          gcc -Wall -Wextra -pedantic -std=gnu99 -Werror -O1 cf-test-child.c -o build/cf-test-child.exe
+      - name: Native Windows TLS and operation tests
+        run: |
+          export CF_CLIENT="$(cygpath -w "$PWD/build/cf-client.exe")"
+          export CF_APRO="$(cygpath -w "$PWD/build/cf-apro.exe")"
+          export CF_FIXTURE="$(cygpath -w "$PWD/build/cf-test-child.exe")"
+          export CF_TEST_TMP="$(cygpath -w "$PWD/build")"
+          python cf-client-tests.py

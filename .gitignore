@@ -53,6 +53,7 @@ dkms.conf
 
 # Project-local developer files
 CLAUDE.md
+cf-client-win-apro.c
 
 # Downloaded dependencies (miniz amalgamation)
 miniz.h

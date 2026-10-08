@@ -1,6 +1,3 @@
 #!/bin/sh
-set -x
-PIPE="$1"
-CMD="$2"
-PORT=`cfpipe "$PIPE" "EXEC 0 $CMD" | awk '{print $3}' `
-nc localhost $PORT
+set -eu
+exec "$(dirname "$0")/cfctl" "$1" exec "$2"

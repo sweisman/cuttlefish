@@ -1,322 +1,137 @@
 package cf;
 use strict;
-
+use warnings;
 use Socket ();
-use IO::Compress::Gzip ();
+use IO::Socket::UNIX;
+use IO::Socket::INET;
+use IO::Select;
+use Digest::SHA qw(sha256_hex);
+use Time::HiRes qw(time sleep);
 
-sub check
-{
-    my $id = shift or return;
+# Existing callers configure $cmf::CF_BASE. Endpoints are TCP ports in legacy
+# mode and owner-only Unix socket paths in v2.
+my %operations;
 
-    if (!(-S "$cmf::CF_BASE/pipes/$id"))
-    {
-        cmf::debug("CF check '$id' no pipe");
-        my $pid = util::data_load("$cmf::CF_BASE/pipes/$id.pid");
-        $pid =~ s/\D+//g;
-        if ($pid)
-        {
-            cmf::debug("CF check '$id' kill process $pid");
-            kill 'KILL', $pid;
-            unlink("$cmf::CF_BASE/pipes/$id.pid");
-        }
-        return;
+sub _path { no warnings 'once'; return "$cmf::CF_BASE/pipes/$_[0]"; }
+sub _write_all {
+    my ($socket, $data) = @_;
+    my $offset = 0;
+    my $deadline = time + 30;
+    my $select = IO::Select->new($socket);
+    while ($offset < length($data)) {
+        die "cuttlefish write timeout\n" if time >= $deadline;
+        next unless $select->can_write(0.1);
+        my $count = syswrite($socket, $data, length($data) - $offset, $offset);
+        die "cuttlefish write failed: $!\n" unless defined($count) && $count > 0;
+        $offset += $count;
+        $deadline = time + 30;
     }
-
-    my $result = cmd($id, 'STATUS');
-    if (!$result)
-    {
-        cmf::debug("CF check '$id' no status");
-        return;
-    }
-
-    if ($result !~ /LAST_PING=T-(\d+)/)
-    {
-        cmf::debug("CF check '$id' bad status format:", $result, '===');
-        cmd($id, 'CLOSE');
-        return;
-    }
-    elsif ($1 > 30)
-    {
-        cmf::debug("CF check '$id' keepalive timeout exceeded at $1 seconds");
-        cmd($id, 'CLOSE');
-        return;
-    }
-
-    return 1;
 }
 
-sub cmd_file
-{
-    my $id = shift;
-    my $file = shift or return;
-    my $data = shift;
-    my ($ref, $send, $tmp, $compress);
-
-    return unless check($id);
-
-    if ($data)
-    {
-        $send = 1;
-        $ref = (ref($data) ? $data : \$data);
+sub _read_all {
+    my ($socket, $limit) = @_;
+    my $data = '';
+    my $select = IO::Select->new($socket);
+    while (1) {
+        die "cuttlefish read timeout\n" unless $select->can_read(30);
+        my $count = sysread($socket, my $chunk, 8192);
+        die "cuttlefish read failed: $!\n" unless defined $count;
+        last unless $count;
+        die "cuttlefish response limit exceeded\n" if length($data) + $count > $limit;
+        $data .= $chunk;
     }
-
-    if ($send)
-    {
-        if ($file !~ /apro/i)
-        {
-            if (length($$ref) > 1024 && $file !~ /\.(?:gz|zip)$/i)
-            {
-                $file .= '.gz';
-
-                if (!IO::Compress::Gzip::gzip($ref => \$compress))
-                {
-                    cmf::debug("cf::cmd_file: gzip failed: '$IO::Compress::Gzip::GzipError'");
-                    return;
-                }
-
-                $ref = \$compress;
-            }
-
-            cmd_exec($id, qq{cmd /C del "$file"});
-        }
-    }
-
-    my $port = cmd_connect($id, "FILE 0 $file");
-    if (!$port)
-    {
-        cmf::debug("ERROR: '$id' FILE 0 $send $file");
-        return;
-    }
-
-    if ($send)
-    {
-# xxx check return values
-        _port($port, $ref);
-        _wait($id, $port);
-        sleep(1); # xxx test shorter periods
-
-# xxx check return values and return actual status
-        cmd_exec($id, qq{gzip -d -f "$file"}) if $compress;
-        return;
-    }
-
-    my $data = _port($port);
-    _wait($id, $port);
     return $data;
 }
 
-sub cmd_exec
-{
-    my $id = shift;
-    my $command = shift;
-    my $keep_alive = shift;
-
-    return unless check($id);
-
-    # list contents of a directory
-    # cfpipe user001 "COMMAND 0 cmd /C dir \"c:\\Program Files\\\""
-    # get the remote DOS command line
-    # cfpipe user001 "COMMAND 0 cmd /K"
-
-    # xxx put timeout here
-    my $port = cmd_connect($id, "EXEC 0 $command") or return;
-    return $port if $keep_alive;
-    my $data = _port($port);
-    _wait($id, $port);
-    return $data;
+sub cmd {
+    my ($id, $command) = @_;
+    die "invalid cuttlefish command\n" unless defined($command) && length($command) < 1024 && $command !~ /[\r\n\0]/;
+    my $socket = IO::Socket::UNIX->new(Type => Socket::SOCK_STREAM(), Peer => _path($id))
+        or die "cuttlefish control connect failed: $!\n";
+    _write_all($socket, "$command\n");
+    my $response = _read_all($socket, 128 * 1024);
+    close($socket);
+    return $response;
 }
 
-sub cmd_connect
-{
+sub check {
     my $id = shift;
-    my $command = shift;
+    return unless defined($id) && -S _path($id);
+    my $status = cmd($id, 'STATUS');
+    return $status =~ /LAST_PING=T-(\d+)/ && $1 <= 30;
+}
 
-    return unless check($id);
-
+sub cmd_connect {
+    my ($id, $command) = @_;
     my $response = cmd($id, $command);
-    return if index($response, 'SUCC') < 0;
-    return $1 if $response =~ /(\d+)\s*$/;
-    cmf::debug("cf::cmd_connect: invalid response '$response' for id $id and command '$command'");
-    return;
+    if ($response =~ /^\w+ SUCCESS (\d+) (\/[^\r\n]+)\n$/) {
+        $operations{$2} = [$id, $1];
+        return $2;
+    }
+    return $1 if $response =~ /^\w+ SUCCESS (\d+)\n$/;
+    die "cuttlefish: $response";
 }
 
-sub cmd
-{
-    my $path = "$cmf::CF_BASE/pipes/" . shift;
-    my $data = shift or return;
-    $data .= ' ';
-
-    if (!(-S $path))
-    {
-        cmf::debug("cf::cmd $path '$data': invalid or not found");
-        return;
+sub _port {
+    my ($endpoint, $data) = @_;
+    my $socket = $endpoint =~ m{^/}
+        ? IO::Socket::UNIX->new(Type => Socket::SOCK_STREAM(), Peer => $endpoint)
+        : IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $endpoint, Proto => 'tcp', Timeout => 30);
+    die "cuttlefish data connect failed: $!\n" unless $socket;
+    if (defined $data) {
+        my $bytes = ref($data) ? $$data : $data;
+        _write_all($socket, $bytes);
+        shutdown($socket, 1) or die "cuttlefish shutdown failed: $!\n";
+        my $unexpected = _read_all($socket, 8192);
+        die "cuttlefish upload unexpectedly received data (legacy FILE direction mismatch)\n" if length($unexpected);
+        close($socket);
+        return 1;
     }
-
-    if (!socket(SOCK, Socket::PF_UNIX(), Socket::SOCK_STREAM(), 0))
-    {
-        cmf::debug("cf::cmd $path '$data': socket error: $!");
-        return;
-    }
-
-    if (!connect(SOCK, Socket::sockaddr_un($path)))
-    {
-        cmf::debug("cf::cmd $path '$data': connect error: $!");
-        return;
-    }
-
-    if (syswrite(SOCK, $data) != length($data))
-    {
-        cmf::debug("cf::cmd $path '$data': syswrite error");
-        return;
-    }
-
-    my ($rv, $rin, $len, $response);
-
-    vec($rin, fileno(SOCK), 1) = 1;
-
-    do
-    {
-        $rv = select($rin, undef, undef, 10);
-        cmf::debug("cf::cmd $path '$data': select error: $!") if $rv < 0;
-        last if $rv < 1;
-
-        $len = sysread(SOCK, $data, 200);
-        $response .= $data;
-
-    } while ($len);
-
-    close(SOCK);
-
+    shutdown($socket, 1) if exists $operations{$endpoint};
+    my $response = _read_all($socket, 8 * 1024 * 1024);
+    close($socket);
     return $response;
 }
 
-sub _port
-{
-    my $port = shift or return;
-    my $data = shift;
-    my ($sock, $response);
-
-    if (!socket($sock, Socket::PF_INET(), Socket::SOCK_STREAM(), getprotobyname('tcp')))
-    {
-        cmf::debug("ERROR cf::port: socket error: $!");
-        return;
-    }
-
-    if (!connect($sock, Socket::sockaddr_in($port, Socket::INADDR_LOOPBACK())))
-    {
-        cmf::debug("ERROR cf::port: connect error: $!");
-        return;
-    }
-
-    my $ref = (ref($data) ? $data : \$data);
-
-    my ($rv, $vin, $vout, $len);
-
-    vec($vin, fileno($sock), 1) = 1;
-
-    if ($$ref)
-    {
-        my $i = 0;
-
-        #my $old_sock = select($sock); $| = 1; select($old_sock);
-        #setsockopt($sock, SOL_SOCKET, SO_LINGER, pack('i2', 1, 16));
-#        $response = print $sock $$ref;
-#        $response = syswrite($sock, $$ref);
-#        return close($sock) && $response;
-
-        do
-        {
-            $rv = select(undef, $vout = $vin, undef, 10);
-
-            if ($rv < 0)
-            {
-                cmf::debug("ERROR cf::_port: write select error: $!");
-                last;
-            }
-            elsif (!$rv)
-            {
-                cmf::debug('ERROR cf::_port: $rv == 0');
-                next;
-            }
-
-            $len += syswrite($sock, $$ref, 512, $i);
-            $i += 512;
-        } while $len < length($$ref);
-
-        if ($len == length($$ref))
-        {
-            select(undef, $vout = $vin, undef, 10);
-            $response = 1;
+sub _wait {
+    my ($id, $endpoint) = @_;
+    my $deadline = time + 30;
+    while (time < $deadline) {
+        if (my $operation = $operations{$endpoint}) {
+            my $response = cmd($id, "RESULT $operation->[1]");
+            if ($response =~ /^OK(?:\s|$)/) { delete $operations{$endpoint}; return 1; }
+            die "cuttlefish: $response" unless $response eq "PENDING\n";
+        } else {
+            return 1 unless cmd($id, 'LIST') =~ /\bLOCAL_PORT=\Q$endpoint\E\b/;
         }
-
-        #$response = syswrite($sock, $$ref);
-        return close($sock) && $response;
+        sleep(0.05);
     }
-
-    do
-    {
-        $rv = select($vout = $vin, undef, undef, 60);
-
-        if ($rv > 0)
-        {
-            $len = sysread($sock, $data, 2048);
-            $response .= $data;
-#~ cmf::debug("read data " . length($data));
-        }
-        elsif ($rv < 0)
-        {
-            cmf::debug("ERROR cf::_port: rv == '$rv', read select error: $!");
-        }
-    } while ($len && $rv > 0);
-
-    close($sock);
-    return $response;
+    die "cuttlefish completion timeout\n";
 }
 
-sub _wait
-{
-    select(undef, undef, undef, 0.1) while cmd($_[0], 'LIST') =~ /\bLOCALPORT=$_[1]\b/;
+sub cmd_exec {
+    my ($id, $command, $keep_alive) = @_;
+    my $endpoint = cmd_connect($id, "EXEC 0 $command");
+    return $endpoint if $keep_alive;
+    my $data = _port($endpoint);
+    _wait($id, $endpoint);
+    return $data;
+}
+
+sub cmd_file {
+    my ($id, $file, $data) = @_;
+    my $v2 = cmd($id, 'STATUS') =~ /PROTOCOL=v2/;
+    my $command;
+    if (defined($data) && $v2) {
+        my $bytes = ref($data) ? $$data : $data;
+        $command = 'PUT 0 ' . length($bytes) . ' ' . sha256_hex($bytes) . " $file";
+    } else {
+        $command = ($v2 ? 'GET' : 'FILE') . " 0 $file";
+    }
+    my $endpoint = cmd_connect($id, $command);
+    my $response = _port($endpoint, $data);
+    _wait($id, $endpoint);
+    return $response;
 }
 
 1;
-
-__END__
-
-cfpipe is a BASH script that simplifies using CF command pipes from the command line
-
-cfpipe user001 STATUS
-cfpipe user001 LIST
-cfpipe user001 CLOSE
-# get time
-cfpipe user001 "CONNECT 0 localhost 13"
-
-if (0)
-{
-    if ($send)
-    {
-        $tmp = "$cmf::TMP/eki-cf-file-$$";
-        open(my $fh, '>', $tmp);
-        if ($compress)
-        {
-            if (!IO::Compress::Gzip::gzip($data => $fh))
-            {
-                cmf::debug("cf::cmd_file: gzip failed: '$IO::Compress::Gzip::GzipError'");
-                return;
-            }
-        }
-        else
-        {
-            print $fh $$data;
-        }
-        close($fh);
-
-        `cat $tmp | nc localhost $port -q1`;
-        # select(undef, undef, undef, 0.1) while cmd($id, 'LIST') =~ /\bLOCALPORT=$port\b/;
-        unlink($tmp);
-
-        cmd_exec($id, qq{gzip -d "$file"}) if $compress;
-
-        # cmd($id, 'COMPRESSION -');
-        return;
-    }
-}

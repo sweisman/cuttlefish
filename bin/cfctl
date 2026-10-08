@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Cuttlefish local controller. Copyright (C) Scott Weisman."""
+import argparse
+import hashlib
+import os
+import select
+import socket
+import sys
+import time
+
+
+def request(path, text):
+    if any(c in text for c in "\r\n\0") or len(text.encode()) >= 1024:
+        raise ValueError("invalid or overlong control command")
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(30)
+        sock.connect(path)
+        sock.sendall(text.encode() + b"\n")
+        response = bytearray()
+        while chunk := sock.recv(4096):
+            response.extend(chunk)
+            if len(response) > 128 * 1024:
+                raise RuntimeError("oversized control response")
+    return response.decode()
+
+
+def start(path, text):
+    response = request(path, text).strip().split(maxsplit=3)
+    if len(response) not in (3, 4) or response[1] != "SUCCESS":
+        raise RuntimeError(" ".join(response))
+    if len(response) == 4:
+        sock = socket.socket(socket.AF_UNIX)
+        endpoint, operation = response[3], int(response[2])
+    else:
+        sock = socket.socket(socket.AF_INET)
+        endpoint, operation = ("127.0.0.1", int(response[2])), None
+    sock.settimeout(30)
+    try:
+        sock.connect(endpoint)
+    except BaseException:
+        sock.close()
+        if operation is not None:
+            request(path, f"CANCEL {operation}")
+        raise
+    return sock, operation
+
+
+def result(path, operation):
+    if operation is None:
+        return
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        response = request(path, f"RESULT {operation}").strip()
+        if response.startswith("OK"):
+            return
+        if response != "PENDING":
+            raise RuntimeError(response)
+        time.sleep(0.05)
+    raise TimeoutError("operation completion deadline exceeded")
+
+
+def transfer(path, command, source=None, interactive=False):
+    sock, operation = start(path, command)
+    try:
+        with sock:
+            if source is not None:
+                while chunk := source.read(65536):
+                    sock.sendall(chunk)
+                sock.shutdown(socket.SHUT_WR)
+            elif not interactive and operation is not None:
+                sock.shutdown(socket.SHUT_WR)
+            if interactive:
+                inputs = [sock, sys.stdin.buffer]
+                while True:
+                    ready, _, _ = select.select(inputs, [], [], 30)
+                    if not ready:
+                        raise TimeoutError("interactive session stalled")
+                    if sys.stdin.buffer in ready:
+                        chunk = os.read(sys.stdin.fileno(), 1024)
+                        if chunk:
+                            sock.sendall(chunk)
+                        else:
+                            inputs.remove(sys.stdin.buffer)
+                            sock.shutdown(socket.SHUT_WR)
+                    if sock in ready:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+            else:
+                while chunk := sock.recv(65536):
+                    if source is None:
+                        sys.stdout.buffer.write(chunk)
+                    else:
+                        raise RuntimeError("upload received unexpected data; legacy FILE may be a download")
+        result(path, operation)
+    except BaseException:
+        if operation is not None:
+            try:
+                request(path, f"CANCEL {operation}")
+            except (OSError, RuntimeError):
+                pass
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("control", help="control socket path, or client CN with CF_BASE configured")
+    sub = parser.add_subparsers(dest="action", required=True)
+    cmd = sub.add_parser("exec")
+    cmd.add_argument("command")
+    sub.add_parser("shell")
+    get = sub.add_parser("get")
+    get.add_argument("remote")
+    put = sub.add_parser("put")
+    put.add_argument("local")
+    put.add_argument("remote")
+    raw = sub.add_parser("command")
+    raw.add_argument("text")
+    args = parser.parse_args()
+    path = args.control
+    if "/" not in path:
+        base = os.environ.get("CF_BASE")
+        if not base:
+            parser.error("use a control socket path or set CF_BASE")
+        path = os.path.join(base, "pipes", path)
+    if args.action == "command":
+        print(request(path, args.text), end="")
+        return
+    v2 = "PROTOCOL=v2" in request(path, "STATUS")
+    if args.action == "exec":
+        transfer(path, "EXEC 0 " + args.command)
+    elif args.action == "shell":
+        transfer(path, "EXEC 0 cmd.exe", interactive=True)
+    elif args.action == "get":
+        transfer(path, ("GET" if v2 else "FILE") + " 0 " + args.remote)
+    else:
+        with open(args.local, "rb") as source:
+            digest, size = hashlib.sha256(), 0
+            while chunk := source.read(65536):
+                digest.update(chunk)
+                size += len(chunk)
+            source.seek(0)
+            command = f"PUT 0 {size} {digest.hexdigest()} {args.remote}" if v2 else "FILE 0 " + args.remote
+            transfer(path, command, source=source)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"cuttlefish: {error}", file=sys.stderr)
+        sys.exit(1)
