@@ -20,7 +20,7 @@ import unittest
 
 def winpath(path):
     path = str(Path(path).resolve())
-    return path if os.name == "nt" else "Z:" + path.replace("/", "\\")
+    return path.replace("/", "\\") if os.name == "nt" else "Z:" + path.replace("/", "\\")
 
 
 def wire(kind, operation=0, data=b""):
@@ -269,8 +269,9 @@ commonName=supplied
         (target / "secret.txt").write_bytes(b"secret")
         link = self.allowed / "junction"
         launcher = [os.environ["CF_WINE"]] if "CF_WINE" in os.environ else []
-        subprocess.run(launcher + ["cmd", "/c", "mklink", "/J", winpath(link), winpath(target)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=dict(os.environ, WINEDEBUG="-all"))
+        created = subprocess.run(launcher + ["cmd", "/c", "mklink", "/J", winpath(link), winpath(target)],
+                                 capture_output=True, text=True, env=dict(os.environ, WINEDEBUG="-all"))
+        self.assertEqual(created.returncode, 0, created.stdout + created.stderr)
         try:
             with self.peer(apro=True) as peer:
                 peer.request(10, 51, winpath(self.allowed) + "\\junction\\secret.txt")
